@@ -53,7 +53,12 @@
       <div class="editor-wrap">
         <div class="editor-toolbar">
           <span id="editorLang" class="muted">Python 3</span>
-          <button class="btn btn-outline btn-sm" onclick="resetTemplate()">↺ 重置模板</button>
+          <div class="flex gap-8" style="position:relative">
+            <button class="btn btn-outline btn-sm" id="loadTplBtn" onclick="toggleTplMenu(event)">📄 载入模板 ▾</button>
+            <button class="btn btn-outline btn-sm" onclick="openTplManager()">🗂 我的模板</button>
+            <button class="btn btn-outline btn-sm" onclick="resetTemplate()">↺ 重置模板</button>
+            <div id="tplMenu" class="tpl-menu hidden"></div>
+          </div>
         </div>
         <textarea id="codeEditor" class="editor-fallback" spellcheck="false"></textarea>
       </div>
@@ -90,6 +95,9 @@
       java: 'import java.util.*;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        // 在此编写代码\n    }\n}\n',
     };
     const LANG_MODE = { python: "python", cpp: "text/x-c++src", c: "text/x-csrc", java: "text/x-java" };
+    const LANG_NAME = { python: "Python 3", cpp: "C++17", c: "C11", java: "Java 17" };
+
+    let allTemplates = [];
 
     function initEditor() {
       const ta = document.getElementById("codeEditor");
@@ -119,13 +127,272 @@
     }
     function onLangChange() {
       const lang = document.getElementById("langSelect").value;
-      document.getElementById("editorLang").textContent = LANG_MODE[lang];
+      document.getElementById("editorLang").textContent = LANG_NAME[lang] || lang;
       if (editor) editor.setOption("mode", LANG_MODE[lang]);
     }
     function resetTemplate() {
+      // 优先使用当前语言的默认个人模板，否则回退到内置骨架
       const lang = document.getElementById("langSelect").value;
-      setCode(TEMPLATES[lang]);
+      const def = allTemplates.find(t => t.language === lang && t.is_default);
+      setCode(def ? def.content : TEMPLATES[lang]);
       onLangChange();
+    }
+
+    /* ---------- 个人代码模板 ---------- */
+    async function fetchTemplates(force) {
+      if (!OJ_.currentUser()) { allTemplates = []; return allTemplates; }
+      try {
+        const data = await OJ_.api("/templates");
+        allTemplates = data.items || [];
+      } catch (e) {
+        if (!force) allTemplates = allTemplates || [];
+        throw e;
+      }
+      return allTemplates;
+    }
+
+    async function toggleTplMenu(ev) {
+      ev.stopPropagation();
+      const menu = document.getElementById("tplMenu");
+      if (!menu.classList.contains("hidden")) { menu.classList.add("hidden"); return; }
+      if (!OJ_.currentUser()) {
+        OJ_.toast("请先登录后使用个人模板", "error");
+        location.href = "/index.html?login=1";
+        return;
+      }
+      menu.classList.remove("hidden");
+      await renderTplMenu();
+    }
+
+    async function renderTplMenu() {
+      const menu = document.getElementById("tplMenu");
+      const lang = document.getElementById("langSelect").value;
+      menu.innerHTML = '<div class="tpl-menu-head">载入模板 · ' + OJ_.esc(LANG_NAME[lang]) + '</div>';
+      try {
+        await fetchTemplates();
+      } catch (e) {
+        menu.innerHTML += `<div class="tpl-empty">加载失败：${OJ_.esc(e.message)}</div>`;
+        return;
+      }
+      const items = allTemplates.filter(t => t.language === lang);
+      if (!items.length) {
+        menu.innerHTML += `
+          <div class="tpl-empty">
+            <div style="font-size:22px">🗂️</div>
+            <div>当前语言还没有模板</div>
+            <div class="hint">可在「我的模板」中新建，保存后即可一键载入</div>
+            <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="document.getElementById('tplMenu').classList.add('hidden');openTplManager()">+ 新建模板</button>
+          </div>`;
+        return;
+      }
+      for (const t of items) {
+        const node = document.createElement("div");
+        node.className = "tpl-item";
+        const NL = String.fromCharCode(10);
+        const snippet = OJ_.esc((t.content || "").split(NL).slice(0, 2).join(NL)).slice(0, 80) || "（空模板）";
+        node.innerHTML = `
+          <div class="tpl-item-main">
+            <span class="tpl-item-name">${OJ_.esc(t.name)}</span>
+            ${t.is_default ? '<span class="tag" style="margin:0">默认</span>' : ''}
+          </div>
+          <div class="tpl-item-snippet">${snippet}</div>`;
+        node.onclick = () => {
+          document.getElementById("tplMenu").classList.add("hidden");
+          applyTemplate(t);
+        };
+        menu.appendChild(node);
+      }
+    }
+
+    async function applyTemplate(t) {
+      // 载入即整体替换编辑器内容；已有非内置内容时先确认，避免误覆盖
+      const cur = getCode();
+      const builtins = Object.values(TEMPLATES);
+      const isPristine = !cur.trim() || builtins.includes(cur);
+      if (!isPristine && cur !== t.content) {
+        if (!(await OJ_.confirmDialog(`载入「${t.name}」将替换编辑器中的现有代码，是否继续？`))) return;
+      }
+      document.getElementById("langSelect").value = t.language;
+      onLangChange();
+      setCode(t.content);
+      OJ_.toast(`已载入模板「${t.name}」`, "success");
+    }
+
+    document.addEventListener("click", (e) => {
+      const menu = document.getElementById("tplMenu");
+      if (menu && !menu.classList.contains("hidden") &&
+          !menu.contains(e.target) && e.target.id !== "loadTplBtn") {
+        menu.classList.add("hidden");
+      }
+    });
+
+    /* ---------- 模板管理弹窗 ---------- */
+    let tplModal = null;
+    let editingTpl = null;
+
+    async function openTplManager() {
+      if (!OJ_.currentUser()) {
+        OJ_.toast("请先登录后管理个人模板", "error");
+        location.href = "/index.html?login=1";
+        return;
+      }
+      const mask = document.createElement("div");
+      mask.className = "modal-mask";
+      mask.innerHTML = `
+        <div class="modal" style="max-width:760px">
+          <div class="flex-between" style="margin-bottom:16px">
+            <h3 style="margin:0">🗂 我的代码模板</h3>
+            <button class="btn btn-outline btn-sm" onclick="closeTplManager()">关闭 ✕</button>
+          </div>
+          <div id="tplMgrBody"><div class="empty">加载中…</div></div>
+        </div>`;
+      mask.addEventListener("click", (e) => { if (e.target === mask) mask.remove(); });
+      document.body.appendChild(mask);
+      tplModal = mask;
+      editingTpl = null;
+      await refreshTplManager();
+    }
+
+    function closeTplManager() { if (tplModal) { tplModal.remove(); tplModal = null; } }
+
+    async function refreshTplManager() {
+      const body = tplModal && tplModal.querySelector("#tplMgrBody");
+      if (!body) return;
+      body.innerHTML = '<div class="empty">加载中…</div>';
+      try {
+        await fetchTemplates(true);
+      } catch (e) {
+        body.innerHTML = `<div class="empty">加载失败：${OJ_.esc(e.message)}</div>`;
+        return;
+      }
+      if (editingTpl === "new" || (editingTpl && editingTpl.id)) {
+        body.innerHTML = tplFormHTML(editingTpl === "new" ? null : editingTpl);
+        return;
+      }
+      if (!allTemplates.length) {
+        body.innerHTML = `
+          <div class="empty">
+            <div style="font-size:30px">🗂️</div>
+            <div style="margin:8px 0">还没有任何代码模板</div>
+            <div class="hint" style="margin-bottom:14px">为每种语言保存常用的输入输出框架，编辑器里一键载入；首个模板会自动成为该语言默认</div>
+            <button class="btn btn-primary" onclick="editTpl('new')">+ 新建模板</button>
+          </div>`;
+        return;
+      }
+      const groups = ["python", "cpp", "c", "java"]
+        .map(l => ({ lang: l, items: allTemplates.filter(t => t.language === l) }))
+        .filter(g => g.items.length);
+      body.innerHTML = `
+        <div style="margin-bottom:12px;display:flex;justify-content:flex-end">
+          <button class="btn btn-primary btn-sm" onclick="editTpl('new')">+ 新建模板</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模板名</th><th>语言</th><th>默认</th><th class="text-right">操作</th></tr></thead>
+            <tbody>
+              ${groups.map(g => g.items.map(t => `
+                <tr>
+                  <td>${OJ_.esc(t.name)}</td>
+                  <td><span class="tag">${OJ_.esc(LANG_NAME[t.language])}</span></td>
+                  <td>${t.is_default ? '<span class="badge AC">默认</span>' : '<span class="muted">—</span>'}</td>
+                  <td class="text-right text-nowrap">
+                    ${t.is_default ? "" : `<button class="btn btn-outline btn-sm" onclick="setDefaultTpl('${t.id}')">设为默认</button>`}
+                    <button class="btn btn-outline btn-sm" onclick="editTpl('${t.id}')">编辑</button>
+                    <button class="btn btn-danger btn-sm" onclick="removeTpl('${t.id}')">删除</button>
+                  </td>
+                </tr>`).join("")).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="hint" style="margin-top:10px">默认模板会在打开编辑器时自动载入；每种语言最多一个默认模板。</div>`;
+    }
+
+    function tplFormHTML(t) {
+      const isNew = !t;
+      const curLang = document.getElementById("langSelect").value;
+      const lang = t ? t.language : curLang;
+      return `
+        <div class="form-group">
+          <label>模板名称</label>
+          <input id="tplFormName" maxlength="100" placeholder="例如：ACM 标准输入框架" value="${OJ_.esc(t ? t.name : "")}">
+        </div>
+        <div class="form-group">
+          <label>编程语言</label>
+          <select id="tplFormLang">
+            ${Object.keys(LANG_NAME).map(k =>
+              `<option value="${k}" ${k === lang ? "selected" : ""}>${LANG_NAME[k]}</option>`).join("")}
+          </select>
+          <div class="hint">切换语言后，默认标记将在新语言内重新生效</div>
+        </div>
+        <div class="form-group">
+          <label>模板内容</label>
+          <textarea id="tplFormContent" style="height:260px;font-family:var(--mono)" spellcheck="false" placeholder="粘贴你的代码框架…">${OJ_.esc(t ? t.content : "")}</textarea>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" onclick="editingTpl=null;refreshTplManager()">取消</button>
+          <button class="btn btn-primary" onclick="saveTpl(${isNew ? "null" : `'${t.id}'`})">保存模板</button>
+        </div>`;
+    }
+
+    function editTpl(idOrNew) {
+      if (idOrNew === "new") {
+        editingTpl = "new";
+        refreshTplManager();
+      } else {
+        editingTpl = allTemplates.find(t => t.id === idOrNew) || null;
+        refreshTplManager();
+      }
+    }
+
+    async function saveTpl(id) {
+      const body = {
+        name: document.getElementById("tplFormName").value,
+        language: document.getElementById("tplFormLang").value,
+        content: document.getElementById("tplFormContent").value,
+      };
+      if (!body.name.trim()) { OJ_.toast("模板名称不能为空", "error"); return; }
+      try {
+        if (id) await OJ_.api("/templates/" + id, { method: "PUT", body });
+        else await OJ_.api("/templates", { method: "POST", body });
+        editingTpl = null;
+        OJ_.toast("模板已保存", "success");
+        await refreshTplManager();
+      } catch (e) {
+        OJ_.toast(e.message, "error");
+      }
+    }
+
+    async function setDefaultTpl(id) {
+      try {
+        await OJ_.api(`/templates/${id}/default`, { method: "POST" });
+        await refreshTplManager();
+        OJ_.toast("已设为该语言默认模板", "success");
+      } catch (e) {
+        OJ_.toast(e.message, "error");
+      }
+    }
+
+    async function removeTpl(id) {
+      const t = allTemplates.find(x => x.id === id);
+      if (!await OJ_.confirmDialog(`确定删除模板「${t ? t.name : ""}」吗？此操作不可恢复。`)) return;
+      try {
+        await OJ_.api("/templates/" + id, { method: "DELETE" });
+        await refreshTplManager();
+        OJ_.toast("模板已删除", "success");
+      } catch (e) {
+        OJ_.toast(e.message, "error");
+      }
+    }
+
+    async function autoLoadDefault() {
+      // 打开编辑器时自动带上当前语言的默认模板；没有模板则保持内置骨架、编辑器照常可用
+      if (!OJ_.currentUser()) return;
+      try {
+        await fetchTemplates();
+      } catch (e) { return; }
+      const lang = document.getElementById("langSelect").value;
+      const def = allTemplates.find(t => t.language === lang && t.is_default);
+      if (def) setCode(def.content);
     }
 
     async function loadProblems() {
@@ -227,6 +494,7 @@
     initEditor();
     loadProblems();
     loadContests();
+    autoLoadDefault();
   </script>
 </body>
 </html>
