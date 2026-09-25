@@ -53,7 +53,13 @@
       <div class="editor-wrap">
         <div class="editor-toolbar">
           <span id="editorLang" class="muted">Python 3</span>
-          <button class="btn btn-outline btn-sm" onclick="resetTemplate()">↺ 重置模板</button>
+          <div class="tpl-bar">
+            <select id="tplSelect" class="tpl-select" title="我的代码模板"></select>
+            <button class="btn btn-outline btn-sm" id="tplLoadBtn" onclick="loadSelectedTemplate()">📥 载入模板</button>
+            <button class="btn btn-outline btn-sm" onclick="saveAsTemplate()">💾 存为模板</button>
+            <button class="btn btn-outline btn-sm" onclick="openTemplateManager()">🗂 管理模板</button>
+            <button class="btn btn-outline btn-sm" onclick="resetTemplate()">↺ 重置模板</button>
+          </div>
         </div>
         <textarea id="codeEditor" class="editor-fallback" spellcheck="false"></textarea>
       </div>
@@ -90,6 +96,11 @@
       java: 'import java.util.*;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        // 在此编写代码\n    }\n}\n',
     };
     const LANG_MODE = { python: "python", cpp: "text/x-c++src", c: "text/x-csrc", java: "text/x-java" };
+    const LANG_NAME = { python: "Python 3", cpp: "C++17", c: "C11", java: "Java 17" };
+
+    // ---- 我的代码模板 ----
+    let myTemplates = [];      // 当前用户的全部模板
+    let lastLoadedCode = "";   // 最近一次由系统填入的内容（用于判断用户是否改过代码）
 
     function initEditor() {
       const ta = document.getElementById("codeEditor");
@@ -119,13 +130,215 @@
     }
     function onLangChange() {
       const lang = document.getElementById("langSelect").value;
-      document.getElementById("editorLang").textContent = LANG_MODE[lang];
+      document.getElementById("editorLang").textContent = LANG_NAME[lang];
       if (editor) editor.setOption("mode", LANG_MODE[lang]);
+      renderTplSelect();
+      // 内容为空或未被用户修改过时，自动带入该语言的默认模板
+      const cur = getCode();
+      if (!cur.trim() || cur === lastLoadedCode) applyDefaultTemplate();
     }
     function resetTemplate() {
       const lang = document.getElementById("langSelect").value;
       setCode(TEMPLATES[lang]);
+      lastLoadedCode = TEMPLATES[lang];
       onLangChange();
+    }
+
+    // ---- 我的代码模板：加载 / 渲染 ----
+    function curLang() { return document.getElementById("langSelect").value; }
+    function langTemplates(lang) { return myTemplates.filter(t => t.language === (lang || curLang())); }
+
+    async function refreshTemplates() {
+      if (!OJ_.currentUser()) { myTemplates = []; renderTplSelect(); return; }
+      try {
+        const data = await OJ_.api("/templates");
+        myTemplates = data.items || [];
+      } catch (e) { myTemplates = []; }
+      renderTplSelect();
+    }
+
+    function renderTplSelect() {
+      const sel = document.getElementById("tplSelect");
+      const loadBtn = document.getElementById("tplLoadBtn");
+      if (!OJ_.currentUser()) {
+        sel.innerHTML = '<option value="">登录后可用我的模板</option>';
+        sel.disabled = true; loadBtn.disabled = true;
+        return;
+      }
+      sel.disabled = false;
+      const list = langTemplates();
+      if (!list.length) {
+        // 空状态：没有可载入的模板
+        sel.innerHTML = '<option value="">暂无模板，点「存为模板」创建</option>';
+        loadBtn.disabled = true;
+        return;
+      }
+      sel.innerHTML = list.map(t =>
+        `<option value="${OJ_.esc(t.id)}">${t.is_default ? "★ " : ""}${OJ_.esc(t.name)}</option>`).join("");
+      loadBtn.disabled = false;
+    }
+
+    function applyDefaultTemplate() {
+      const def = langTemplates().find(t => t.is_default);
+      if (!def) return;
+      setCode(def.code);
+      lastLoadedCode = def.code;
+    }
+
+    function doLoadTemplate(tpl) {
+      const langSel = document.getElementById("langSelect");
+      if (tpl.language !== langSel.value) { langSel.value = tpl.language; onLangChange(); }
+      setCode(tpl.code);
+      lastLoadedCode = tpl.code;
+      OJ_.toast(`已载入模板「${tpl.name}」`, "success");
+    }
+
+    async function loadSelectedTemplate() {
+      if (!OJ_.currentUser()) { OJ_.toast("请先登录后使用代码模板", "error"); return; }
+      const tpl = myTemplates.find(t => t.id === document.getElementById("tplSelect").value);
+      if (!tpl) { OJ_.toast("请选择要载入的模板", "error"); return; }
+      const cur = getCode();
+      if (cur.trim() && cur !== lastLoadedCode &&
+          !(await OJ_.confirmDialog("载入模板将覆盖当前编辑器内容，确定继续？"))) return;
+      doLoadTemplate(tpl);
+    }
+
+    // ---- 保存当前代码为模板 ----
+    function saveAsTemplate() {
+      if (!OJ_.currentUser()) { OJ_.toast("请先登录后使用代码模板", "error"); return; }
+      const code = getCode();
+      if (!code.trim()) { OJ_.toast("编辑器内容为空，无法保存为模板", "error"); return; }
+      const mask = OJ_.openModal("💾 保存为模板", `
+        <div class="form-group"><label>模板名称</label>
+          <input id="tplSaveName" maxlength="50" placeholder="例如：快速读入框架"></div>
+        <div class="form-group"><label><input type="checkbox" id="tplSaveDefault"> 设为 ${LANG_NAME[curLang()]} 的默认模板（打开编辑器自动带入）</label></div>
+        <div class="hint">语言：${LANG_NAME[curLang()]} · 内容为当前编辑器中的代码</div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="tplSaveCancel">取消</button>
+          <button class="btn btn-primary" id="tplSaveOk">保存</button>
+        </div>`);
+      mask.querySelector("#tplSaveCancel").onclick = () => mask.remove();
+      mask.querySelector("#tplSaveOk").onclick = async () => {
+        const name = mask.querySelector("#tplSaveName").value.trim();
+        if (!name) { OJ_.toast("请输入模板名称", "error"); return; }
+        try {
+          await OJ_.api("/templates", { method: "POST", body: {
+            name, language: curLang(), code,
+            is_default: mask.querySelector("#tplSaveDefault").checked,
+          }});
+          mask.remove();
+          OJ_.toast("模板已保存", "success");
+          await refreshTemplates();
+        } catch (e) { OJ_.toast(e.message, "error"); }
+      };
+      mask.querySelector("#tplSaveName").focus();
+    }
+
+    // ---- 模板管理（列表 / 新建 / 编辑 / 删除 / 设默认） ----
+    async function openTemplateManager() {
+      if (!OJ_.currentUser()) { OJ_.toast("请先登录后管理代码模板", "error"); return; }
+      await refreshTemplates();
+      const mask = OJ_.openModal("🗂 我的代码模板", `<div id="tplMgrBody"></div>`);
+      renderTplManager(mask);
+    }
+
+    function renderTplManager(mask) {
+      const body = mask.querySelector("#tplMgrBody");
+      if (!myTemplates.length) {
+        body.innerHTML = `
+          <div class="empty">📄 还没有任何代码模板<br>
+            <span class="hint">把常用的输入输出框架存成模板，写题时一键载入</span></div>
+          <div style="text-align:center;margin-top:12px">
+            <button class="btn btn-primary btn-sm" id="tplNewBtn">＋ 新建模板</button>
+          </div>`;
+      } else {
+        const rows = myTemplates.map(t => `<tr>
+          <td>${t.is_default ? '<span class="tpl-star">★</span> ' : ""}${OJ_.esc(t.name)}</td>
+          <td>${OJ_.esc(LANG_NAME[t.language] || t.language)}</td>
+          <td class="muted">${OJ_.esc(OJ_.fmtTime(t.updated_at))}</td>
+          <td class="text-right">
+            <button class="btn btn-outline btn-sm" data-act="load" data-id="${OJ_.esc(t.id)}">载入</button>
+            ${t.is_default ? "" : `<button class="btn btn-outline btn-sm" data-act="default" data-id="${OJ_.esc(t.id)}">设为默认</button>`}
+            <button class="btn btn-outline btn-sm" data-act="edit" data-id="${OJ_.esc(t.id)}">编辑</button>
+            <button class="btn btn-danger btn-sm" data-act="del" data-id="${OJ_.esc(t.id)}">删除</button>
+          </td>
+        </tr>`).join("");
+        body.innerHTML = `
+          <div class="table-wrap"><table>
+            <thead><tr><th>名称</th><th>语言</th><th>更新时间</th><th class="text-right">操作</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table></div>
+          <div style="margin-top:12px"><button class="btn btn-primary btn-sm" id="tplNewBtn">＋ 新建模板</button></div>
+          <div class="hint" style="margin-top:8px">★ 为默认模板：打开编辑器时会自动带入对应语言的默认模板。</div>`;
+        body.querySelectorAll("button[data-act]").forEach(btn => {
+          btn.onclick = () => tplManagerAction(mask, btn.getAttribute("data-act"), btn.getAttribute("data-id"));
+        });
+      }
+      body.querySelector("#tplNewBtn").onclick = () => renderTplForm(mask, null);
+    }
+
+    async function tplManagerAction(mask, act, id) {
+      const tpl = myTemplates.find(t => t.id === id);
+      if (!tpl) return;
+      if (act === "load") {
+        const cur = getCode();
+        if (cur.trim() && cur !== lastLoadedCode &&
+            !(await OJ_.confirmDialog("载入模板将覆盖当前编辑器内容，确定继续？"))) return;
+        mask.remove();
+        doLoadTemplate(tpl);
+      } else if (act === "edit") {
+        renderTplForm(mask, tpl);
+      } else if (act === "default") {
+        try {
+          await OJ_.api("/templates/" + id, { method: "PUT", body: { is_default: true } });
+          OJ_.toast(`「${tpl.name}」已设为默认模板`, "success");
+          await refreshTemplates();
+          renderTplManager(mask);
+        } catch (e) { OJ_.toast(e.message, "error"); }
+      } else if (act === "del") {
+        if (!(await OJ_.confirmDialog(`确定删除模板「${tpl.name}」？删除后不可恢复。`))) return;
+        try {
+          await OJ_.api("/templates/" + id, { method: "DELETE" });
+          OJ_.toast("模板已删除", "success");
+          await refreshTemplates();
+          renderTplManager(mask);
+        } catch (e) { OJ_.toast(e.message, "error"); }
+      }
+    }
+
+    function renderTplForm(mask, tpl) {
+      const body = mask.querySelector("#tplMgrBody");
+      const langOpts = Object.keys(LANG_NAME).map(k =>
+        `<option value="${k}" ${tpl && tpl.language === k ? "selected" : ""}>${LANG_NAME[k]}</option>`).join("");
+      body.innerHTML = `
+        <div class="form-group"><label>模板名称</label>
+          <input id="tplFormName" maxlength="50" value="${tpl ? OJ_.esc(tpl.name) : ""}" placeholder="例如：快速读入框架"></div>
+        <div class="form-group"><label>语言</label><select id="tplFormLang">${langOpts}</select></div>
+        <div class="form-group"><label>模板代码</label>
+          <textarea id="tplFormCode" class="tpl-form-code" spellcheck="false" placeholder="在此粘贴或编写模板代码">${tpl ? OJ_.esc(tpl.code) : ""}</textarea></div>
+        <div class="form-group"><label><input type="checkbox" id="tplFormDefault" ${tpl && tpl.is_default ? "checked" : ""}> 设为该语言的默认模板</label></div>
+        <div class="modal-actions">
+          <button class="btn btn-outline" id="tplFormBack">← 返回列表</button>
+          <button class="btn btn-primary" id="tplFormSave">${tpl ? "保存修改" : "创建模板"}</button>
+        </div>`;
+      body.querySelector("#tplFormBack").onclick = () => renderTplManager(mask);
+      body.querySelector("#tplFormSave").onclick = async () => {
+        const payload = {
+          name: body.querySelector("#tplFormName").value.trim(),
+          language: body.querySelector("#tplFormLang").value,
+          code: body.querySelector("#tplFormCode").value,
+          is_default: body.querySelector("#tplFormDefault").checked,
+        };
+        if (!payload.name) { OJ_.toast("请输入模板名称", "error"); return; }
+        if (!payload.code.trim()) { OJ_.toast("模板代码不能为空", "error"); return; }
+        try {
+          if (tpl) await OJ_.api("/templates/" + tpl.id, { method: "PUT", body: payload });
+          else await OJ_.api("/templates", { method: "POST", body: payload });
+          OJ_.toast(tpl ? "模板已更新" : "模板已创建", "success");
+          await refreshTemplates();
+          renderTplManager(mask);
+        } catch (e) { OJ_.toast(e.message, "error"); }
+      };
     }
 
     async function loadProblems() {
@@ -227,6 +440,11 @@
     initEditor();
     loadProblems();
     loadContests();
+    // 加载我的模板；若当前语言有默认模板且编辑器内容未被修改，自动带入
+    refreshTemplates().then(() => {
+      const cur = getCode();
+      if (!cur.trim() || cur === lastLoadedCode) applyDefaultTemplate();
+    });
   </script>
 </body>
 </html>
